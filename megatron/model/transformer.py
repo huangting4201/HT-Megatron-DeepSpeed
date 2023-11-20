@@ -123,6 +123,19 @@ class ParallelMLP(MegatronModule):
             moe=moe,
             enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
         )
+        
+        self.dense_h_to_4h_w2 = tensor_parallel.ColumnParallelLinear(
+            config.hidden_size,
+            ffn_hidden_size,
+            config=config,
+            init_method=config.init_method,
+            bias=self.add_bias,
+            gather_output=False,
+            skip_bias_add=True,
+            moe=moe,
+            enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
+        )
+        
 
         self.bias_gelu_fusion = False
         self.activation_func = None
@@ -161,7 +174,7 @@ class ParallelMLP(MegatronModule):
 
         # [s, b, 4hp]
         intermediate_parallel, bias_parallel = self.dense_h_to_4h(hidden_states)
-
+        intermediate_parallel_w2,bias_parallel=self.dense_h_to_4h_w2(hidden_states)
         if self.bias_gelu_fusion:
             assert self.add_bias is True
             # DeepSpeed FLOPS profiler temporarily substitues functions like F.gelu to calculate the throughput
@@ -173,6 +186,9 @@ class ParallelMLP(MegatronModule):
             intermediate_parallel = self.activation_func(intermediate_parallel)
 
         # [s, b, h]
+        
+        intermediate_parallel_w2=self.activation_func(intermediate_parallel_w2)
+        intermediate_parallel=intermediate_parallel*intermediate_parallel_w2
         output, output_bias = self.dense_4h_to_h(intermediate_parallel)
         return output, output_bias
 

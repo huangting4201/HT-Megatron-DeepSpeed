@@ -1234,29 +1234,29 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                               opt_param_scheduler)
 
         # Evaluation
-        if args.eval_interval and iteration % args.eval_interval == 0 and \
-           args.do_valid:
-            prefix = 'iteration {}'.format(iteration)
-            evaluate_and_print_results(prefix, forward_step_func,
-                                       valid_data_iterator, model,
-                                       iteration, process_non_loss_data_func,
-                                       config, False)
+        # if args.eval_interval and iteration % args.eval_interval == 0 and \
+        #    args.do_valid:
+        #     prefix = 'iteration {}'.format(iteration)
+        #     evaluate_and_print_results(prefix, forward_step_func,
+        #                                valid_data_iterator, model,
+        #                                iteration, process_non_loss_data_func,
+        #                                config, False)
 
         # Checkpointing
-        saved_checkpoint = False
-        if args.exit_signal_handler:
-            signal_handler = get_signal_handler()
-            if any(signal_handler.signals_received()):
-                save_checkpoint_and_time(iteration, model, optimizer,
-                                         opt_param_scheduler)
-                print_datetime('exiting program after receiving SIGTERM.')
-                sys.exit()
+        # saved_checkpoint = False
+        # if args.exit_signal_handler:
+        #     signal_handler = get_signal_handler()
+        #     if any(signal_handler.signals_received()):
+        #         save_checkpoint_and_time(iteration, model, optimizer,
+        #                                  opt_param_scheduler)
+        #         print_datetime('exiting program after receiving SIGTERM.')
+        #         sys.exit()
 
-        if args.save and args.save_interval and \
-           iteration % args.save_interval == 0:
-            save_checkpoint_and_time(iteration, model, optimizer,
-                                     opt_param_scheduler)
-            saved_checkpoint = True
+        # if args.save and args.save_interval and \
+        #    iteration % args.save_interval == 0:
+        #     save_checkpoint_and_time(iteration, model, optimizer,
+        #                              opt_param_scheduler)
+        #     saved_checkpoint = True
 
         # Exiting based on duration
         if args.exit_duration_in_mins:
