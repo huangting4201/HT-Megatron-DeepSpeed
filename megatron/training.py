@@ -1189,7 +1189,7 @@ def train(
         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = None, None, None, None
 
         try:
-            torch.cuda.memory._record_memory_history(enabled=True)
+            torch.cuda.memory._record_memory_history()
             loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = train_step(
                 forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config
             )
