@@ -1187,16 +1187,9 @@ def train(
         args.curr_iteration = iteration
 
         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = None, None, None, None
-
-        try:
-            torch.cuda.memory._record_memory_history()
-            loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = train_step(
-                forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config
-            )
-            torch.cuda.memory._dump_snapshot(f"my_snapshot_{torch.distributed.get_rank()}.pickle")
-        except Exception as err:
-            print(err, flush=True)
-            torch.cuda.memory._dump_snapshot(f"my_snapshot_{torch.distributed.get_rank()}.pickle")
+        loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = train_step(
+            forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config
+        )
 
         iteration += 1
         args.iteration = iteration

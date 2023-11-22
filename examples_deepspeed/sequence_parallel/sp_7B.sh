@@ -2,14 +2,18 @@
 set -x
 # Runs the "codeparrot-small" parameter model
 
+# export NCCL_DEBUG=info
+export NCCL_SOCKET_IFNAME="bond0"
+export NCCL_IB_HCA="mlx5_2,mlx5_3,mlx5_4,mlx5_5"
+
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 my_shard='zero15'
 
 #30B model config
-num_layers=60
-hidden_size=6144
+num_layers=32
+hidden_size=4096
 seq_length=${1:-4096}
-num_attention_heads=48
+num_attention_heads=32
 export seq_length=${seq_length}
 
 
@@ -59,20 +63,24 @@ GPT_ARGS=" \
     --num-layers ${num_layers}
     --hidden-size ${hidden_size}
     --num-attention-heads ${num_attention_heads}
-    --ds-sequence-parallel-size 16 \
+    --ds-sequence-parallel-size 8 \
     --seq-length ${seq_length}
-    --use-rotary-position-embeddings
+    --use-rotary-position-embeddings \
+    --use-flash-attn-v2 \
+    --ffn-hidden-size 16384 \
+    --disable-bias-linear \
+    --untie-embeddings-and-output-weights \
     --max-position-embeddings ${seq_length}
     --micro-batch-size ${micro_batch_size}
     --global-batch-size ${global_batch_size}
-    --lr 0.0005
+    --lr 0.0001
     --train-iters 20
     --lr-decay-iters 150000
     --lr-decay-style cosine
     --lr-warmup-iters 2000
     --weight-decay .1
     --adam-beta2 .999
-    --fp16
+    --bf16
     --log-interval 1
     --save-interval 2000
     --eval-interval 200
@@ -102,8 +110,8 @@ sed "s/CONFIG_BATCH_SIZE/${global_batch_size}/" ${template_json} \
     | sed "s/LOG_INTERVAL/${log_interval}/" \
     | sed "s/ZERO_STAGE/${zero_stage}/" \
     | sed "s/PRESCALE_GRAD/false/" \
-    | sed "s/CONFIG_FP16_ENABLED/true/" \
-    | sed "s/CONFIG_BF16_ENABLED/false/" \
+    | sed "s/CONFIG_FP16_ENABLED/false/" \
+    | sed "s/CONFIG_BF16_ENABLED/true/" \
       > ${config_json}
 else
 sed "s/CONFIG_BATCH_SIZE/${global_batch_size}/" ${template_json} \
@@ -111,8 +119,8 @@ sed "s/CONFIG_BATCH_SIZE/${global_batch_size}/" ${template_json} \
     | sed "s/LOG_INTERVAL/${log_interval}/" \
     | sed "s/ZERO_STAGE/${zero_stage}/" \
     | sed "s/PRESCALE_GRAD/true/" \
-    | sed "s/CONFIG_FP16_ENABLED/true/" \
-    | sed "s/CONFIG_BF16_ENABLED/false/" \
+    | sed "s/CONFIG_FP16_ENABLED/false/" \
+    | sed "s/CONFIG_BF16_ENABLED/true/" \
       > ${config_json}
 fi
 
@@ -131,7 +139,6 @@ deepspeed_options="
     --deepspeed_config ${config_json}
     --zero-stage $zero_stage \
     --pipeline-model-parallel-size 1 \
-    --deepspeed-activation-checkpointing \
 "
 
 if [[ "${no_pp}" = "true" ]]; then
