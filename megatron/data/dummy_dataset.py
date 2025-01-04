@@ -18,7 +18,7 @@ class RandomDataset(Dataset):
 
     """
 
-    def __init__(self, num_samples=100000, seq_len=1024) -> None:
+    def __init__(self, num_samples=100000, seq_len=1024, fixed_seqlen=True) -> None:
         super().__init__()
         rng = np.random.RandomState(1999)
 
@@ -29,6 +29,11 @@ class RandomDataset(Dataset):
         lengths = []
         for n, r in zip(max_num, rep_num):
             d = list(range(n)) * r
+            if fixed_seqlen:
+                while len(d) < seq_len:
+                    r *= 2
+                    d = list(range(n)) * r
+            r = r % 50257
             d = [n, r] + d
             d = d[:seq_len]
             data.append(d)

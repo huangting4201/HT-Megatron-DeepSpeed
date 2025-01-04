@@ -37,6 +37,7 @@ def model_provider(pre_process=True, post_process=True):
 
     args = get_args()
     config = core_transformer_config_from_args(args)
+    # with deepspeed.zero.MiCS_Init(
     with deepspeed.zero.Init(
         sequence_data_parallel_group=mpu.get_sequence_data_parallel_group(),
         remote_device=None if args.remote_device == "none" else args.remote_device,
@@ -81,6 +82,10 @@ def model_provider(pre_process=True, post_process=True):
                 post_process=post_process,
             )
     see_memory_usage(f"After Building Model", force=True)
+
+    if torch.distributed.get_rank() == 0:
+        print(f"ht debug model:{model}", flush=True)
+
     return model
 
 
@@ -369,9 +374,9 @@ def random_train_valid_test_datasets_provider(train_val_test_num_samples):
     args = get_args()
 
     print_rank_0("> building train, validation, and test datasets " "for llama ...")
-    train_ds = RandomDataset(num_samples=1000000, seq_len=args.seq_length)
-    valid_ds = RandomDataset(num_samples=20000, seq_len=args.seq_length)
-    test_ds = RandomDataset(num_samples=10000, seq_len=args.seq_length)
+    train_ds = RandomDataset(num_samples=10000, seq_len=args.seq_length, fixed_seqlen=True)
+    valid_ds = RandomDataset(num_samples=200, seq_len=args.seq_length)
+    test_ds = RandomDataset(num_samples=100, seq_len=args.seq_length)
     print_rank_0("> finished creating llama datasets ...")
 
     return train_ds, valid_ds, test_ds

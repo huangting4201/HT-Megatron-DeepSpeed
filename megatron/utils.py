@@ -6,18 +6,16 @@ import sys
 import os
 
 import torch
+import torch.distributed
 from torch.nn.parallel import DistributedDataParallel as torchDDP
 
 from deepspeed.accelerator import get_accelerator
-if get_accelerator().device_name() == 'cuda':
+
+if get_accelerator().device_name() == "cuda":
     from apex.multi_tensor_apply import multi_tensor_applier
     import amp_C
 
-from megatron import (
-    get_args,
-    get_adlr_autoresume,
-    get_num_microbatches
-)
+from megatron import get_args, get_adlr_autoresume, get_num_microbatches
 from megatron.core import mpu
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 from megatron.model.module import param_is_not_shared
@@ -26,8 +24,7 @@ from megatron.model.rotary_pos_embedding import RotaryEmbedding
 
 def update_rotary_pos_emb(seq_length):
     args = get_args()
-    rotary_dim = args.hidden_size // args.num_attention_heads \
-        if args.kv_channels is None else args.kv_channels
+    rotary_dim = args.hidden_size // args.num_attention_heads if args.kv_channels is None else args.kv_channels
 
     if args.rotary_percent < 1.0:
         rotary_dim = int(rotary_dim * args.rotary_percent)
@@ -35,8 +32,7 @@ def update_rotary_pos_emb(seq_length):
     # partial rotary embeddings, which is better than full rotary
     # Wang and Komatsuzaki et al
     # https://github.com/kingoflolz/mesh-transformer-jax/
-    rotary_pos_emb = RotaryEmbedding(rotary_dim)(seq_length).to(
-        get_accelerator().current_device_name())
+    rotary_pos_emb = RotaryEmbedding(rotary_dim)(seq_length).to(get_accelerator().current_device_name())
     args.rotary_pos_emb = rotary_pos_emb
 
 
@@ -56,7 +52,7 @@ def unwrap_model(model, module_instances=(torchDDP)):
 
 
 def calc_params_l2_norm(model):
-    """Calculate l2 norm of parameters """
+    """Calculate l2 norm of parameters"""
     args = get_args()
     if not isinstance(model, list):
         model = [model]
@@ -73,33 +69,25 @@ def calc_params_l2_norm(model):
                     params_data.append(param.data)
     # Calculate norm
     dummy_overflow_buf = get_accelerator().IntTensor([0])
-    
-    if get_accelerator().device_name() == 'cuda':
+
+    if get_accelerator().device_name() == "cuda":
 
         norm, _ = multi_tensor_applier(
-            amp_C.multi_tensor_l2norm,
-            dummy_overflow_buf,
-            [params_data],
-            False # no per-parameter norm
+            amp_C.multi_tensor_l2norm, dummy_overflow_buf, [params_data], False  # no per-parameter norm
         )
-    else :
-        norm = torch.norm(params_data,p=2.0)
+    else:
+        norm = torch.norm(params_data, p=2.0)
     norm_2 = norm * norm
     # Sum across all model-parallel GPUs.
-    torch.distributed.all_reduce(norm_2,
-                                 op=torch.distributed.ReduceOp.SUM,
-                                 group=mpu.get_model_parallel_group())
+    torch.distributed.all_reduce(norm_2, op=torch.distributed.ReduceOp.SUM, group=mpu.get_model_parallel_group())
     return norm_2.item() ** 0.5
 
 
 def average_losses_across_data_parallel_group(losses):
     """Reduce a tensor of losses across all GPUs."""
-    averaged_losses = torch.cat(
-        [loss.clone().detach().view(1) for loss in losses])
-    torch.distributed.all_reduce(averaged_losses,
-                                 group=mpu.get_data_parallel_group())
-    averaged_losses = averaged_losses / \
-        torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
+    averaged_losses = torch.cat([loss.clone().detach().view(1) for loss in losses])
+    torch.distributed.all_reduce(averaged_losses, group=mpu.get_data_parallel_group())
+    averaged_losses = averaged_losses / torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
 
     return averaged_losses
 
@@ -107,40 +95,33 @@ def average_losses_across_data_parallel_group(losses):
 def report_memory(name):
     """Simple GPU memory report."""
     mega_bytes = 1024.0 * 1024.0
-    string = name + ' memory (MB)'
-    string += ' | allocated: {}'.format(
-        get_accelerator().memory_allocated() / mega_bytes)
-    string += ' | max allocated: {}'.format(
-        get_accelerator().max_memory_allocated() / mega_bytes)
-    string += ' | reserved: {}'.format(
-        get_accelerator().memory_reserved() / mega_bytes)
-    string += ' | max reserved: {}'.format(
-        get_accelerator().max_memory_reserved() / mega_bytes)
+    string = name + " memory (MB)"
+    string += " | allocated: {}".format(get_accelerator().memory_allocated() / mega_bytes)
+    string += " | max allocated: {}".format(get_accelerator().max_memory_allocated() / mega_bytes)
+    string += " | reserved: {}".format(get_accelerator().memory_reserved() / mega_bytes)
+    string += " | max reserved: {}".format(get_accelerator().max_memory_reserved() / mega_bytes)
     if mpu.get_data_parallel_rank() == 0:
-        print("[Rank {}] {}".format(torch.distributed.get_rank(), string),
-              flush=True)
+        print("[Rank {}] {}".format(torch.distributed.get_rank(), string), flush=True)
 
 
 def print_params_min_max_norm(optimizer, iteration):
     """Print min, max, and norm of all parameters."""
     index = 0
     rank = torch.distributed.get_rank()
-    string = 'iteration, rank, index, tensor-model-parallel, min, max, norm\n'
+    string = "iteration, rank, index, tensor-model-parallel, min, max, norm\n"
     optimizer_ = optimizer.optimizer
     for param_group in optimizer_.param_groups:
-        for param in param_group['params']:
+        for param in param_group["params"]:
             index += 1
             min_ = param.data.min()
             max_ = param.data.max()
             norm = torch.linalg.norm(param.data)
-            string += '{:7d}, {:4d}, {:4d}, {:2d}, '.format(
-                iteration, rank, index, int(param.tensor_model_parallel))
-            string += '{:.6E}, {:.6E}, {:.6E}\n'.format(min_, max_, norm)
+            string += "{:7d}, {:4d}, {:4d}, {:2d}, ".format(iteration, rank, index, int(param.tensor_model_parallel))
+            string += "{:.6E}, {:.6E}, {:.6E}\n".format(min_, max_, norm)
     print(string, flush=True)
 
 
-def check_adlr_autoresume_termination(iteration, model,
-                                      optimizer, opt_param_scheduler):
+def check_adlr_autoresume_termination(iteration, model, optimizer, opt_param_scheduler):
     """Check for autoresume signal and exit if it is received."""
     from megatron.checkpointing import save_checkpoint
 
@@ -158,12 +139,9 @@ def check_adlr_autoresume_termination(iteration, model,
         sys.exit(0)
 
 
-def get_ltor_masks_and_position_ids(data,
-                                    eod_token,
-                                    reset_position_ids,
-                                    reset_attention_mask,
-                                    eod_mask_loss,
-                                    skip_mask=False):
+def get_ltor_masks_and_position_ids(
+    data, eod_token, reset_position_ids, reset_attention_mask, eod_mask_loss, skip_mask=False
+):
     """Build masks and position id for left to right model."""
 
     # Extract batch size and sequence length.
@@ -177,8 +155,9 @@ def get_ltor_masks_and_position_ids(data,
 
     attention_mask = None
     if not skip_mask:
-        attention_mask = torch.tril(torch.ones(
-            (att_mask_batch, seq_length, seq_length))).view(att_mask_batch, 1, seq_length, seq_length)
+        attention_mask = torch.tril(torch.ones((att_mask_batch, seq_length, seq_length))).view(
+            att_mask_batch, 1, seq_length, seq_length
+        )
 
     # Loss mask.
     loss_mask = torch.ones(data.size(), dtype=torch.float, device=data.device)
@@ -186,8 +165,7 @@ def get_ltor_masks_and_position_ids(data,
         loss_mask[data == eod_token] = 0.0
 
     # Position ids.
-    position_ids = torch.arange(seq_length, dtype=torch.long,
-                                device=data.device)
+    position_ids = torch.arange(seq_length, dtype=torch.long, device=data.device)
     position_ids = position_ids.unsqueeze(0).expand_as(data)
     # We need to clone as the ids will be modifed based on batch index.
     if reset_position_ids:
@@ -209,15 +187,15 @@ def get_ltor_masks_and_position_ids(data,
                 i = eod_index[j]
                 # Mask attention loss.
                 if reset_attention_mask and not skip_mask:
-                    attention_mask[b, 0, (i + 1):, :(i + 1)] = 0
+                    attention_mask[b, 0, (i + 1) :, : (i + 1)] = 0
                 # Reset positions.
                 if reset_position_ids:
-                    position_ids[b, (i + 1):] -= (i + 1 - prev_index)
+                    position_ids[b, (i + 1) :] -= i + 1 - prev_index
                     prev_index = i + 1
 
     # Convert attention mask to binary:
     if not skip_mask:
-        attention_mask = (attention_mask < 0.5)
+        attention_mask = attention_mask < 0.5
         attention_mask = attention_mask.to(data.device)
 
     return attention_mask, loss_mask, position_ids
@@ -231,9 +209,10 @@ def print_rank_0(message):
     else:
         print(message, flush=True)
 
+
 def is_last_rank():
-    return torch.distributed.get_rank() == (
-        torch.distributed.get_world_size() - 1)
+    return torch.distributed.get_rank() == (torch.distributed.get_world_size() - 1)
+
 
 def print_rank_last(message):
     """If distributed is initialized, print only on last rank."""
@@ -243,90 +222,216 @@ def print_rank_last(message):
     else:
         print(message, flush=True)
 
+
 def is_aml():
     # Are we running inside an Azure Machine Learning (AML) environment?
-    return 'AZUREML_EXPERIMENT_ID' in os.environ
+    return "AZUREML_EXPERIMENT_ID" in os.environ
+
 
 def is_rank_0():
     """Check whether it is rank 0. For AML, check if it is rank 0 of a node"""
     if torch.distributed.is_initialized():
         if torch.distributed.get_rank() == 0 or (
             is_aml() and torch.distributed.get_rank() % get_accelerator().device_count() == 0
-            ):
+        ):
             return True
         else:
             return False
     else:
         return True
 
+
 def get_parameters_in_billions(model):
     gpus_per_model = torch.distributed.get_world_size(group=mpu.get_model_parallel_group())
 
-    approx_parameters_in_billions = sum([sum([p.ds_numel if hasattr(p,'ds_id') else  p.nelement() for p in model_module.parameters()])
-                                        for model_module in model])
+    approx_parameters_in_billions = sum(
+        [
+            sum([p.ds_numel if hasattr(p, "ds_id") else p.nelement() for p in model_module.parameters()])
+            for model_module in model
+        ]
+    )
 
-    return approx_parameters_in_billions*gpus_per_model/(1e9)
+    return approx_parameters_in_billions * gpus_per_model / (1e9)
+
 
 def throughput_calculator(model, args, iteration_time, total_iterations):
     batch_size = args.micro_batch_size * get_num_microbatches() * args.data_parallel_size
     approx_parameters_in_billions = None if (model is None) else get_parameters_in_billions(model)
-    elapsed_time_per_iter = iteration_time/total_iterations
+    elapsed_time_per_iter = iteration_time / total_iterations
     samples_per_second = batch_size / elapsed_time_per_iter
 
-    #flops calculator
+    # flops calculator
     hidden_size = args.hidden_size
     num_layers = args.num_layers
+    num_heads = args.num_attention_heads
     vocab_size = args.padded_vocab_size
+
+    if torch.distributed.get_rank() == 0:
+        print(f"ht debug vocab_size:{vocab_size}", flush=True)
+
+    if os.getenv("USE_MLA", "False") == "True":
+        print(f"ht debug is using MLA", flush=True)
+        v_head_dim = 128
+        qk_nope_head_dim = 128
+        qk_rope_head_dim = 64
+        q_lora_rank = 1536
+        kv_lora_rank = 512
+        mlp_ratio = 3.5
+        seq_len = args.seq_length
+        global_batch_size = batch_size
+        checkpoint_activations_factor = 3
+
+        mlp_ratio = mlp_ratio * 3 / 2
+
+        # first k dense / dense model
+        # sum=2*3*(b*s*mlp_ratio*d^2) = 4*mlp_ratio *bs* d^2
+        dense_mlp_flops = mlp_ratio * 4 * global_batch_size * seq_len * hidden_size**2
+
+        moe_flops = 0
+        first_k_dense = num_layers
+
+        global_tokens = global_batch_size * seq_len
+        if q_lora_rank is not None or kv_lora_rank is not None:
+            q_head_dim = qk_nope_head_dim + qk_rope_head_dim
+            q_out_dim = q_head_dim * num_heads
+        else:
+            q_out_dim = hidden_size
+        if q_lora_rank is not None:
+            # mla
+            ## q: (bs, d) @(d, q_lora) -> (bs, q_lora);@(q_lora, q_out) ->(bs, q_out)
+            q_flops = 2 * (global_tokens * hidden_size * q_lora_rank + global_tokens * q_out_dim * q_lora_rank)
+        else:
+            # q: (bs, d) @(d, q_out_dim) -> (bs, q_out_dim)
+            q_flops = 2 * global_tokens * hidden_size * q_out_dim
+
+        if kv_lora_rank is not None:
+            # kv:
+            ## (bs, d) @(d, kv_a_out) -> (bs, kv_a_out)
+            ## (bs, kv_lora_rank) @(kv_lora, kv_b_out) -> (bs, kv_b_out)
+            kv_a_out = kv_lora_rank + qk_rope_head_dim
+            kv_b_out = num_heads * (q_head_dim - qk_rope_head_dim + v_head_dim)
+
+            kv_flops = 2 * (global_tokens * kv_a_out * hidden_size + global_tokens * kv_b_out * kv_lora_rank)
+
+            ## (bs, d) @(d, v_dim) -> (bs, v_dim)
+            v_dim = num_heads * v_head_dim
+            attn_out_flops = 2 * global_tokens * v_dim * hidden_size
+        else:
+            kv_flops = 4 * global_tokens * hidden_size**2
+            attn_out_flops = 2 * global_tokens * hidden_size**2
+
+        qkv_flops = kv_flops + q_flops
+
+        # attn: 2*2*bds**2
+        ## (b, nh, s, hd) @(b, nh, hd, s) -> (b, nh, s, s) : b*nh*s**2*hd -> b*d*s**2
+        ## (b, nh, s, s) @ (b, nh, s, hd) -> (b, nh, s, hd): b*s*d*s -> b*d*s**2
+        if q_lora_rank is not None:
+            attn_hidden_size = num_heads * q_head_dim
+            attn_flops = 4 * global_batch_size * seq_len**2 * attn_hidden_size
+        else:
+            attn_flops = 4 * global_batch_size * seq_len**2 * hidden_size
+        attn_flops = attn_flops / 2
+
+        # vocab
+        vocab_flops = 6 * global_batch_size * seq_len * hidden_size * vocab_size
+
+        flops_per_iteration = (
+            checkpoint_activations_factor
+            * (
+                dense_mlp_flops * first_k_dense
+                + (num_layers - first_k_dense) * moe_flops
+                + num_layers * (qkv_flops + attn_flops + attn_out_flops)
+            )
+            + vocab_flops
+        )
+
+        tflops = flops_per_iteration / (elapsed_time_per_iter * args.world_size * (10**12))
+
+        return samples_per_second, tflops, approx_parameters_in_billions
+
+
+    mlp_ratio = 3.5
+    seq_len = args.seq_length
+
+    checkpoint_activations_factor = 3
+
+    # if args.swiglu:
+    #     mlp_ratio = mlp_ratio * 3 / 2
+
+    # 3.5 * 3 * 2
+
+    flops_per_iteration = (
+        # wqkv wo mlp
+        (checkpoint_activations_factor * ((8 + mlp_ratio * 3 * 2) * batch_size * seq_len * hidden_size**2)) * num_layers
+        # attn
+        + checkpoint_activations_factor * (4 * batch_size * seq_len**2 * hidden_size) * num_layers / 2
+        # head
+        + 6 * batch_size * seq_len * hidden_size * vocab_size
+    )
+
+    tflops = flops_per_iteration / (elapsed_time_per_iter * args.world_size * (10**12))
 
     # General TFLOPs formula (borrowed from Equation 3 in Section 5.1 of
     # https://arxiv.org/pdf/2104.04473.pdf).
     # The factor of 4 is when used with activation check-pointing,
     # otherwise it will be 3.
-    checkpoint_activations_factor = 3
-    if hasattr(args, 'checkpoint_activations') and args.checkpoint_activations:
-        checkpoint_activations_factor = 4
-    if hasattr(args, 'recompute_granularity') and (args.recompute_granularity == 'selective' or args.recompute_granularity == 'full'):
-        checkpoint_activations_factor = 4
-    seq_len = args.seq_length
-    if hasattr(args, 'actual_seq_length'):
-        seq_len = args.actual_seq_length
-    flops_per_iteration = (24 * checkpoint_activations_factor * batch_size * seq_len * num_layers * (hidden_size**2)) * (1. + (seq_len / (6. * hidden_size)) + (vocab_size / (16. * num_layers * hidden_size)))
-    tflops = flops_per_iteration / (elapsed_time_per_iter * args.world_size * (10**12))
+    # checkpoint_activations_factor = 3
+    # if hasattr(args, "checkpoint_activations") and args.checkpoint_activations:
+    #     checkpoint_activations_factor = 4
+    # if hasattr(args, "recompute_granularity") and (
+    #     args.recompute_granularity == "selective" or args.recompute_granularity == "full"
+    # ):
+    #     checkpoint_activations_factor = 4
+    # seq_len = args.seq_length
+    # if hasattr(args, "actual_seq_length"):
+    #     seq_len = args.actual_seq_length
+    # flops_per_iteration = (
+    #     24 * checkpoint_activations_factor * batch_size * seq_len * num_layers * (hidden_size**2)
+    # ) * (1.0 + (seq_len / (6.0 * hidden_size)) + (vocab_size / (16.0 * num_layers * hidden_size)))
+    # tflops = flops_per_iteration / (elapsed_time_per_iter * args.world_size * (10**12))
     return samples_per_second, tflops, approx_parameters_in_billions
+
 
 def checkpoint_throughput_calculator(model, latency_second):
     approx_parameters_in_billions = get_parameters_in_billions(model)
     checkpoint_multiplier = 14  # fp16 weights (2), fp32 weights (4), fp32 momentum (4), fp32 variance (4)
     checkpoint_GB = approx_parameters_in_billions * checkpoint_multiplier
     GB_per_second = checkpoint_GB / latency_second
-    print_rank_0(f"Checkpoint Save GB: {round(checkpoint_GB, 3)}, GB/Sec: {round(GB_per_second,2)}, Latency(second): {round(latency_second, 3)}")
+    print_rank_0(
+        f"Checkpoint Save GB: {round(checkpoint_GB, 3)}, GB/Sec: {round(GB_per_second,2)}, Latency(second): {round(latency_second, 3)}"
+    )
 
 
 def get_fingerprint_header():
     return f"{'min':^13} {'max':^13} {'mean':^13} {'l2 norm':^12} metadata"
+
 
 def get_fingerprint(p):
     return f"{p.min():13.6e} {p.max():13.6e} {p.mean():13.6e} {p.norm():12.6e}"
 
 
 def dump_position_embed_weights(preamble, iteration, model):
-    # return 
+    # return
     from deepspeed.utils import safe_get_full_fp32_param
+
     tp_rank = mpu.get_tensor_model_parallel_rank()
     pp_rank = mpu.get_pipeline_model_parallel_rank()
     dp_rank = mpu.get_data_parallel_rank()
     get_fingerprint_header()
     for n, p in model[0].named_parameters():
-        if 'position_embeddings' in n:
+        if "position_embeddings" in n:
             tag = "pos_embed"
         elif "word_embeddings" in n:
             tag = "word_embed"
         else:
-            continue 
+            continue
         print(f"iter {iteration} {preamble} {tag} lp {tp_rank}/{pp_rank}/{dp_rank}: {get_fingerprint(p)} {p.shape}\n")
         fp32_value = safe_get_full_fp32_param(p)
-        if fp32_value is not None: 
-            print(f"iter {iteration} {preamble} {tag} hp {tp_rank}/{pp_rank}/{dp_rank}: {get_fingerprint(fp32_value)} {p.shape}\n")
+        if fp32_value is not None:
+            print(
+                f"iter {iteration} {preamble} {tag} hp {tp_rank}/{pp_rank}/{dp_rank}: {get_fingerprint(fp32_value)} {p.shape}\n"
+            )
+
 
 def dump_weights(preamble, iteration, model, optimizer, tensor=None):
     # return
@@ -337,19 +442,19 @@ def dump_weights(preamble, iteration, model, optimizer, tensor=None):
     fn = f"debug-bf16-{iteration}-pp{pp_rank}-tp{tp_rank}-dp{dp_rank}-{preamble}.txt"
 
     # only care for first and last pp stages and dp0 tp0
-    #if not (mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage()):
+    # if not (mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage()):
     #    return
 
-    #if not (tp_rank == 0 and dp_rank == 0):
+    # if not (tp_rank == 0 and dp_rank == 0):
     #    return
 
     if tensor is not None:
         orig_tensor = tensor
         if hasattr(tensor, "_hp_param"):
-            numel = tensor._hp_param.numel() # // dp_size
+            numel = tensor._hp_param.numel()  # // dp_size
             tensor = tensor.flatten().narrow(0, 0, numel)
 
-    #print(fn)
+    # print(fn)
     with open(fn, "w") as fh:
         fh.write(f"{get_fingerprint_header()}\n")
 
@@ -359,9 +464,7 @@ def dump_weights(preamble, iteration, model, optimizer, tensor=None):
             for n, p in model[0].named_parameters():
                 fh.write(f"{get_fingerprint(p)} {n} {p.shape}\n")
 
-
     return
-
 
     # until we figure out how to dump the actual fp32 values don't do this
     fn = f"debug-fp32-{iteration}-pp{pp_rank}-tp{tp_rank}-dp{dp_rank}-{preamble}.txt"
@@ -371,13 +474,12 @@ def dump_weights(preamble, iteration, model, optimizer, tensor=None):
             tensor = orig_tensor
             if hasattr(tensor, "_hp_param"):
                 fh.write(f"{get_fingerprint(tensor._hp_param)} tensor {tensor._hp_param.shape}\n")
-                #fh.write(f"{get_fingerprint(tensor._hp_grad)} tensor grad\n")
+                # fh.write(f"{get_fingerprint(tensor._hp_grad)} tensor grad\n")
             else:
                 fh.write(f"{get_fingerprint(tensor)} tensor {tensor.shape}\n")
-                #fh.write(f"{get_fingerprint(tensor.grad)} tensor grad\n")
+                # fh.write(f"{get_fingerprint(tensor.grad)} tensor grad\n")
 
         else:
             if hasattr(model[0].module.tied_modules, "embed"):
                 p = model[0].module.tied_modules.embed.word_embeddings.weight._hp_param
                 fh.write(f"{get_fingerprint(p)} module.tied_modules.embed.word_embeddings.weight._hp_param {p.shape}\n")
-

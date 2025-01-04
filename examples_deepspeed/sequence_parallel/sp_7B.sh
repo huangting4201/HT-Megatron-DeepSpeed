@@ -7,20 +7,28 @@ export NCCL_SOCKET_IFNAME="bond0"
 export NCCL_IB_HCA="mlx5_2,mlx5_3,mlx5_4,mlx5_5"
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-my_shard='zero15'
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+# my_shard='zero15'
 
-#30B model config
-num_layers=32
-hidden_size=4096
+#7B model config
+# num_layers=32
+# hidden_size=4096
+# seq_length=${1:-4096}
+# num_attention_heads=32
+
+#70B model config
+num_layers=80
+hidden_size=8192
 seq_length=${1:-4096}
-num_attention_heads=32
+num_attention_heads=64
+
 export seq_length=${seq_length}
 
 
 ## batch config
-# global/micro/worldsize/tp = accumulate gradient
+# global_batch_size/micro_batch_size/dp = accumulate gradient
 # zero 1.5 会使得每一张卡的显存保持一致。然而zero 1 随着rank 数的上升，每张卡分到的 optimizer state 会更少，导致显存占用更少。
-global_batch_size=8
+global_batch_size=1
 micro_batch_size=1
 
 ## ZeRO stage
@@ -53,8 +61,8 @@ NNODES=$SLURM_NNODES
 
 ## file path
 CHECKPOINT_PATH=./tmp
-VOCAB_FILE=/mnt/petrelfs/huangting.p/workspace/HT-Megatron-DeepSpeed/data/gpt2-vocab.json
-MERGE_FILE=/mnt/petrelfs/huangting.p/workspace/HT-Megatron-DeepSpeed/data/gpt2-merges.txt
+VOCAB_FILE=/mnt/petrelfs/sunpeng/huangting/HT-Megatron-DeepSpeed/data/gpt2-vocab.json
+MERGE_FILE=/mnt/petrelfs/sunpeng/huangting/HT-Megatron-DeepSpeed/data/gpt2-merges.txt
 # DATA_PATH=/mnt/petrelfs/wangguoteng.p/chenqiaoling/chenqiaoling/LLaMA-Megatron-DeepSpeed/data/my-gpt2_text_document
 
 
@@ -63,18 +71,18 @@ GPT_ARGS=" \
     --num-layers ${num_layers}
     --hidden-size ${hidden_size}
     --num-attention-heads ${num_attention_heads}
-    --ds-sequence-parallel-size 8 \
+    --ds-sequence-parallel-size 32 \
     --seq-length ${seq_length}
     --use-rotary-position-embeddings \
     --use-flash-attn-v2 \
-    --ffn-hidden-size 16384 \
+    --ffn-hidden-size 14336 \
     --disable-bias-linear \
     --untie-embeddings-and-output-weights \
     --max-position-embeddings ${seq_length}
     --micro-batch-size ${micro_batch_size}
     --global-batch-size ${global_batch_size}
     --lr 0.0001
-    --train-iters 20
+    --train-iters 10
     --lr-decay-iters 150000
     --lr-decay-style cosine
     --lr-warmup-iters 2000
@@ -83,10 +91,17 @@ GPT_ARGS=" \
     --bf16
     --log-interval 1
     --save-interval 2000
-    --eval-interval 200
-    --eval-iters 10
+    --eval-interval 2000
+    --eval-iters 0
+    --checkpoint-activations
+    --recompute-granularity "full"
+    --recompute-method "uniform"
+    --recompute-num-layers 1
 "
-
+# --recompute-granularity "selective"
+# --recompute-granularity "full"
+#     --recompute-method "uniform"
+#     --recompute-num-layers 1
 
 DATA_ARGS="
     --vocab-file $VOCAB_FILE \
@@ -98,12 +113,12 @@ DATA_ARGS="
 OUTPUT_ARGS="
     --log-interval ${log_interval} \
     --save-interval 10000 \
-    --eval-interval 1000 \
-    --eval-iters 10
+    --eval-interval 10000 \
+    --eval-iters 0
 "
 
 template_json="ds_config_gpt_TEMPLATE.json"
-config_json="ds_config_bert_bsz${global_batch_size}_mbsz${batch_size}_log${log_interval}_zero${zero_stage}.json"
+config_json="ds_config_llama_bsz${global_batch_size}_mbsz${batch_size}_log${log_interval}_zero${zero_stage}.json"
 if [[ $zero_stage -gt 0 ]]; then
 sed "s/CONFIG_BATCH_SIZE/${global_batch_size}/" ${template_json} \
     | sed "s/CONFIG_MBSIZE/${micro_batch_size}/" \
@@ -146,7 +161,7 @@ deepspeed_options="${deepspeed_options} \
     --no-pipeline-parallel"
 fi
 
-log_file=flash_attn_8k_debugggg.log
+log_file=ht.log
 
 
 # log_file=test_s{$1}.log
@@ -163,7 +178,7 @@ log_file=flash_attn_8k_debugggg.log
 #         --save $CHECKPOINT_PATH \
 #         #--load $CHECKPOINT_PATH 
 dir=`pwd`
-/mnt/petrelfs/share_data/llm_env/miniconda3-py39_4/envs/llm-flash2.0/bin/torchrun --nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $SLURM_PROCID --master_addr $MASTER_ADDR --master_port $MASTER_PORT \
+/mnt/petrelfs/share_data/huangting.p/envs/llm-torch2.1-flash2/bin/torchrun --nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $SLURM_PROCID --master_addr $MASTER_ADDR --master_port $MASTER_PORT \
     ${dir}/../../pretrain_gpt.py \
     --tensor-model-parallel-size $tp \
     --pipeline-model-parallel-size $pp \

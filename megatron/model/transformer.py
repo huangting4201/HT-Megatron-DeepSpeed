@@ -2,6 +2,7 @@
 
 """Transformer."""
 from contextlib import nullcontext
+import os
 import math
 import numpy as np
 import torch
@@ -54,6 +55,8 @@ try:
     from apex.normalization import MixedFusedRMSNorm
 except ImportError:
     MixedFusedRMSNorm = None
+
+USE_MLA = os.getenv("USE_MLA", "False") == "True"
 
 
 """ We use the following notation throughout this file:
@@ -513,6 +516,455 @@ class FlashSelfAttentionTriton(torch.nn.Module):
         return output
 
 
+# Inverse dim formula to find dim based on number of rotations
+def yarn_find_correction_dim(num_rotations, dim, base=10000, max_position_embeddings=2048):
+    return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (2 * math.log(base))
+
+
+# Find dim range bounds based on rotations
+def yarn_find_correction_range(low_rot, high_rot, dim, base=10000, max_position_embeddings=2048):
+    low = math.floor(yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings))
+    high = math.ceil(yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings))
+    return max(low, 0), min(high, dim - 1)  # Clamp values just in case
+
+
+def yarn_get_mscale(scale=1, mscale=1):
+    if scale <= 1:
+        return 1.0
+    return 0.1 * mscale * math.log(scale) + 1.0
+
+
+def yarn_linear_ramp_mask(min_val, max_val, dim):
+    if min_val == max_val:
+        max_val += 0.001  # Prevent singularity
+
+    linear_func = (torch.arange(dim, dtype=torch.float32) - min_val) / (max_val - min_val)
+    ramp_func = torch.clamp(linear_func, 0, 1)
+    return ramp_func
+
+
+class DeepseekV2RotaryEmbedding(torch.nn.Module):
+    # pylint: disable=missing-class-docstring
+    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+        super().__init__()
+
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        # Build here to make `torch.jit.trace` work.
+        self._set_cos_sin_cache(
+            seq_len=max_position_embeddings,
+            device=self.inv_freq.device,
+            dtype=torch.get_default_dtype(),
+        )
+        self.max_seq_len_cached = None
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
+
+        freqs = torch.outer(t, self.inv_freq.to(t.device))
+        # Different from paper, but it uses a different permutation in order to obtain the same calculation
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
+
+    def forward(self, x, seq_len=None):
+        # x: [bs, num_attention_heads, seq_len, head_size]
+        if self.max_seq_len_cached is None or seq_len > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
+
+        return (
+            self.cos_cached[:seq_len].to(dtype=x.dtype),
+            self.sin_cached[:seq_len].to(dtype=x.dtype),
+        )
+
+
+class DeepseekV2YarnRotaryEmbedding(DeepseekV2RotaryEmbedding):
+    # pylint: disable=missing-class-docstring
+    def __init__(
+        self,
+        dim,
+        max_position_embeddings=2048,
+        base=10000,
+        device=None,
+        scaling_factor=1.0,
+        original_max_position_embeddings=4096,
+        beta_fast=32,
+        beta_slow=1,
+        mscale=1,
+        mscale_all_dim=0,
+    ):
+        self.scaling_factor = scaling_factor
+        self.original_max_position_embeddings = original_max_position_embeddings
+        self.beta_fast = beta_fast
+        self.beta_slow = beta_slow
+        self.mscale = mscale
+        self.mscale_all_dim = mscale_all_dim
+        super().__init__(dim, max_position_embeddings, base, device)
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        dim = self.dim
+
+        freq_extra = 1.0 / (self.base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
+        freq_inter = 1.0 / (
+            self.scaling_factor * self.base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+        )
+
+        low, high = yarn_find_correction_range(
+            self.beta_fast,
+            self.beta_slow,
+            dim,
+            self.base,
+            self.original_max_position_embeddings,
+        )
+        inv_freq_mask = 1.0 - yarn_linear_ramp_mask(low, high, dim // 2).to(device=device, dtype=torch.float32)
+        inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        t = torch.arange(seq_len, device=device, dtype=torch.float32)
+
+        freqs = torch.outer(t, inv_freq)
+
+        _mscale = float(
+            yarn_get_mscale(self.scaling_factor, self.mscale)
+            / yarn_get_mscale(self.scaling_factor, self.mscale_all_dim)
+        )
+
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", (emb.cos() * _mscale).to(dtype), persistent=False)
+        self.register_buffer("sin_cached", (emb.sin() * _mscale).to(dtype), persistent=False)
+
+
+# Copied from transformers.models.llama.modeling_llama.rotate_half
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+class ParallelAttentionMLA(MegatronModule):
+    """Parallel self-attention layer abstract class.
+
+    Self-attention layer takes input with size [s, b, h]
+    and returns output of the same size.
+    """
+
+    def __init__(self, config, layer_number, attention_type=AttnType.self_attn, attn_mask_type=AttnMaskType.padding):
+        super(ParallelAttentionMLA, self).__init__()
+
+        args = get_args()
+        self.layer_number = max(1, layer_number)
+        self.attention_type = attention_type
+        self.attn_mask_type = attn_mask_type
+        self.params_dtype = config.params_dtype
+        self.sequence_parallel = config.sequence_parallel
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.use_gqa = self.num_attention_heads != self.num_key_value_heads
+        self.max_seqlen = args.seq_length
+
+        self.use_flash_attn = (
+            (args.use_flash_attn_v1 or args.use_flash_attn_triton or args.use_flash_attn_v2)
+            and attention_type == AttnType.self_attn
+            and self.attn_mask_type == AttnMaskType.causal
+        )
+        self.use_flash_attn_triton = args.use_flash_attn_triton
+        if self.use_flash_attn:
+            global flash_attn_builder
+            try:
+                flash_attn_builder = FlashAttentionBuilder().load()
+            except TypeError:
+                flash_attn_builder = None
+
+            if args.use_flash_attn_v1:
+                assert flash_attn_unpadded_func != None or flash_attn_builder != None, (
+                    "Cannot import FlashAttention v1 " "and Cannot find FlashAttention Builder"
+                )
+            if args.use_flash_attn_v2:
+                assert flash_attn_varlen_func != None, "Cannot import FlashAttention v2 "
+            if args.use_flash_attn_triton:
+                assert flash_attn_func != None, "Cannot import FlashAttention triton "
+
+            assert attention_type == AttnType.self_attn, (
+                "FlashAttention code path only supports " "self-attention for now"
+            )
+            assert self.attn_mask_type == AttnMaskType.causal, (
+                "FlashAttention code path only " "supports causal mask for now"
+            )
+            if rearrange is None:
+                raise ImportError("einops is not installed, please install with pip install einops")
+
+        projection_size = config.kv_channels * config.num_attention_heads
+
+        # Per attention head and per partition values.
+        world_size = parallel_state.get_tensor_model_parallel_world_size()
+        self.hidden_size_per_attention_head = core.utils.divide(projection_size, config.num_attention_heads)
+        self.num_attention_heads_per_partition = core.utils.divide(config.num_attention_heads, world_size)
+
+        # Per GQA head and per partition values
+        if self.use_gqa:
+            kv_projection_size = config.kv_channels * config.num_key_value_heads
+            self.num_key_value_heads_per_partition = core.utils.divide(config.num_key_value_heads, world_size)
+            self.num_key_value_groups = core.utils.divide(config.num_attention_heads, config.num_key_value_heads)
+            assert self.hidden_size_per_attention_head == core.utils.divide(
+                kv_projection_size, config.num_key_value_heads
+            )
+
+        # MLA config
+        self.q_lora_rank = 1536
+        self.kv_lora_rank = 512
+        self.v_head_dim = 128
+        self.qk_nope_head_dim = 128
+        self.qk_rope_head_dim = 64
+        self.q_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+
+        self.yarn_embed = DeepseekV2YarnRotaryEmbedding(
+            self.qk_rope_head_dim,
+            max_position_embeddings=2048,
+            base=10000,
+        )
+
+        self.q_a_layernorm = LayerNorm(
+            self.q_lora_rank,
+            eps=config.layernorm_epsilon,
+            no_persist_layer_norm=args.no_persist_layer_norm,
+            sequence_parallel=config.sequence_parallel,
+            apply_layernorm_1p=args.apply_layernorm_1p,
+            mem_efficient_ln=args.mem_efficient_ln,
+        )
+        self.kv_a_layernorm = LayerNorm(
+            self.kv_lora_rank,
+            eps=config.layernorm_epsilon,
+            no_persist_layer_norm=args.no_persist_layer_norm,
+            sequence_parallel=config.sequence_parallel,
+            apply_layernorm_1p=args.apply_layernorm_1p,
+            mem_efficient_ln=args.mem_efficient_ln,
+        )
+        self.q_a_proj = tensor_parallel.ColumnParallelLinear(
+            config.hidden_size,
+            self.q_lora_rank,
+            config=config,
+            init_method=config.init_method,
+            bias=args.add_bias_linear,
+            gather_output=False,
+        )
+        self.q_b_proj = tensor_parallel.ColumnParallelLinear(
+            self.q_lora_rank,
+            self.num_attention_heads * self.q_head_dim,
+            config=config,
+            init_method=config.init_method,
+            bias=args.add_bias_linear,
+            gather_output=False,
+        )
+        self.kv_a_proj_with_mqa = tensor_parallel.ColumnParallelLinear(
+            config.hidden_size,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            config=config,
+            init_method=config.init_method,
+            bias=args.add_bias_linear,
+            gather_output=False,
+        )
+        self.kv_b_proj = tensor_parallel.ColumnParallelLinear(
+            self.kv_lora_rank,
+            self.num_attention_heads * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim),
+            config=config,
+            init_method=config.init_method,
+            bias=args.add_bias_linear,
+            gather_output=False,
+        )
+
+        # Currently FlashAttention only works with causal mask
+        if self.use_flash_attn_triton:
+            local_attn = FlashSelfAttentionTriton(causal=True, attention_dropout=args.attention_dropout)
+        elif self.use_flash_attn:
+            local_attn = FlashSelfAttention(causal=True, attention_dropout=config.attention_dropout)
+        else:
+            local_attn = CoreAttention(self.layer_number, config, self.attn_mask_type)
+
+        self.enable_ds_sequence_parallel = (
+            parallel_state.get_sequence_parallel_world_size() > 1 or args.force_ds_sequence_parallel
+        )
+        if self.enable_ds_sequence_parallel:
+            assert dist_attn_supported, "Distributed attention is not supported in this DeepSpeed version"
+            assert args.num_attention_heads % parallel_state.get_sequence_parallel_world_size() == 0
+            self.dist_attn = DistributedAttention(local_attn, parallel_state.get_sequence_parallel_group())
+        else:
+            if self.use_flash_attn:
+                self.core_attention_flash = local_attn
+            else:
+                self.core_attention = local_attn
+                self.checkpoint_core_attention = config.recompute_granularity == "selective"
+
+        # Output.
+        self.dense = tensor_parallel.RowParallelLinear(
+            self.num_attention_heads * self.v_head_dim,
+            config.hidden_size,
+            config=config,
+            init_method=config.output_layer_init_method,
+            bias=args.add_bias_linear,
+            input_is_parallel=True,
+            skip_bias_add=True,
+        )
+
+        print(f"ht debug init ParallelAttentionMLA", flush=True)
+
+    def _checkpointed_attention_forward(self, query_layer, key_layer, value_layer, attention_mask, rotary_pos_emb=None):
+        """Forward method with activation checkpointing."""
+
+        def custom_forward(*inputs):
+            query_layer = inputs[0]
+            key_layer = inputs[1]
+            value_layer = inputs[2]
+            attention_mask = inputs[3]
+            output_ = self.core_attention(query_layer, key_layer, value_layer, attention_mask)
+            return output_
+
+        q_pos_emb, k_pos_emb = (None, None) if rotary_pos_emb is None else rotary_pos_emb
+
+        hidden_states = tensor_parallel.checkpoint(
+            custom_forward, False, query_layer, key_layer, value_layer, attention_mask, q_pos_emb, k_pos_emb
+        )
+
+        return hidden_states
+
+    def _allocate_memory(self, inference_max_sequence_len, batch_size):
+        return torch.empty(
+            inference_max_sequence_len,
+            batch_size,
+            self.num_attention_heads_per_partition,
+            self.hidden_size_per_attention_head,
+            dtype=self.params_dtype,
+            device=get_accelerator().current_device_name(),
+        )
+
+    def repeat_kv(self, hidden_states, n_rep):
+        slen, batch, num_key_value_heads_per_partition, head_dim = hidden_states.shape
+        if n_rep == 1:
+            return hidden_states
+        hidden_states = hidden_states[:, :, :, None, :].expand(
+            slen, batch, num_key_value_heads_per_partition, n_rep, head_dim
+        )
+        return hidden_states.reshape(slen, batch, num_key_value_heads_per_partition * n_rep, head_dim)
+
+    def forward(self, hidden_states, attention_mask, encoder_output=None, inference_params=None, rotary_pos_emb=None):
+        # hidden_states: [sq, b, h]
+
+        # =================================================
+        # Pre-allocate memory for key-values for inference.
+        # =================================================
+        is_first_step = False
+        assert inference_params is None
+
+        # =====================
+        # Query, Key, and Value
+        # =====================
+        q_len, bsz, _ = hidden_states.size()
+
+        q, _ = self.q_a_proj(hidden_states)
+        q = self.q_a_layernorm(q)
+        q, _ = self.q_b_proj(q)
+        q = q.view(bsz, q_len, self.num_attention_heads, self.q_head_dim)
+        # print(f"ht debug {q.shape=}", flush=True)
+
+        compressed_kv, _ = self.kv_a_proj_with_mqa(hidden_states)
+        # print(f"ht debug {compressed_kv.shape=}", flush=True)
+        compressed_kv, k_pe = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim)
+
+        kv = self.kv_a_layernorm(compressed_kv)
+        kv, _ = self.kv_b_proj(kv)
+        kv = kv.view(bsz, q_len, self.num_attention_heads, self.qk_nope_head_dim + self.v_head_dim)
+
+        # ==================================
+        # core attention computation
+        # ==================================
+
+        # apply relative positional encoding (rotary embedding)
+        cos, sin = self.yarn_embed(q, seq_len=self.max_seqlen)
+
+        import dlblas
+        import dlblas.kernels.partial_rotary_emb as partial_rotary_emb
+
+        _start = mpu.get_sequence_parallel_rank() * q_len
+        _end = _start + q_len
+        # print(f"ht debug {_start=} {_end=}", flush=True)
+        position_ids = torch.arange(start=_start, end=_end).to(q.device).unsqueeze(0)
+        # position_ids = torch.arange(0, q_len).to(q.device).unsqueeze(0)
+        # k_pe = rearrange(k_pe, "s b ... -> b s ...").contiguous()
+        # kv = rearrange(kv, "s b ... -> b s ...").contiguous()
+        # q, kv = dlblas.partial_rotary_emb(
+        #     q.contiguous(),
+        #     k_pe.contiguous(),
+        #     kv.contiguous(),
+        #     cos[position_ids].contiguous(),
+        #     sin[position_ids].contiguous(),
+        # )
+        q, kv = partial_rotary_emb.PartialRotaryEmb.apply(
+            q.contiguous(),
+            k_pe.contiguous(),
+            kv.contiguous(),
+            cos[position_ids].contiguous(),
+            sin[position_ids].contiguous(),
+        )
+
+        query_layer = q
+        key_layer = kv[:, :, 0]
+        value_layer = kv[:, :, 1]
+        # print(f"ht debug {query_layer.shape=} {key_layer.shape=} {value_layer.shape=}", flush=True)
+
+        if self.enable_ds_sequence_parallel:
+            if self.use_flash_attn:
+                context_layer = self.dist_attn(query_layer, key_layer, value_layer)
+                # print(f"ht debug {context_layer.shape=}", flush=True)
+
+                if self.q_head_dim != self.v_head_dim:
+                    context_layer = context_layer[:, :, :, : self.v_head_dim]
+                    # print(f"ht debug after {context_layer.shape=}", flush=True)
+
+                if not self.use_flash_attn_triton:
+                    context_layer = rearrange(context_layer, "b s h d -> s b (h d)").contiguous()
+                    # print(f"ht debug after++ {context_layer.shape=}", flush=True)
+            else:
+                context_layer = self.dist_attn(query_layer, key_layer, value_layer, attention_mask)
+        else:
+            if self.use_flash_attn:
+                if not self.use_flash_attn_triton:
+                    query_layer, key_layer, value_layer = [
+                        rearrange(x, "s b ... -> b s ...").contiguous() for x in (query_layer, key_layer, value_layer)
+                    ]
+
+                if self.sequence_parallel:
+                    context_layer = self.core_attention_flash(query_layer, key_layer, value_layer)
+                else:
+                    with tensor_parallel.get_cuda_rng_tracker().fork():
+                        context_layer = self.core_attention_flash(query_layer, key_layer, value_layer)
+
+                if not self.use_flash_attn_triton:
+                    context_layer = rearrange(context_layer, "b s h d -> s b (h d)").contiguous()
+            else:
+                if self.checkpoint_core_attention:
+                    context_layer = self._checkpointed_attention_forward(
+                        query_layer, key_layer, value_layer, attention_mask
+                    )
+                else:
+                    context_layer = self.core_attention(query_layer, key_layer, value_layer, attention_mask)
+
+        # =================
+        # Output. [sq, b, h]
+        # =================
+
+        output, bias = self.dense(context_layer)
+        # print(f"ht debug {output.shape=}", flush=True)
+
+        return output, bias
+
+
 class ParallelAttention(MegatronModule):
     """Parallel self-attention layer abstract class.
 
@@ -851,6 +1303,7 @@ class ParallelAttention(MegatronModule):
                         rearrange(x, "s b ... -> b s ...").contiguous() for x in (query_layer, key_layer, value_layer)
                     ]
 
+                # print(f"ht debug {query_layer.shape=} {key_layer.shape=} {value_layer.shape=}", flush=True)
                 context_layer = self.dist_attn(query_layer, key_layer, value_layer)
 
                 if not self.use_flash_attn_triton:
@@ -883,8 +1336,12 @@ class ParallelAttention(MegatronModule):
         # =================
         # Output. [sq, b, h]
         # =================
+        
+        # print(f"ht debug after++ {context_layer.shape=}", flush=True)
 
         output, bias = self.dense(context_layer)
+
+        # print(f"ht debug {output.shape=}", flush=True)
 
         return output, bias
 
@@ -963,9 +1420,14 @@ class ParallelTransformerLayer(MegatronModule):
         else:
             self.input_layernorm = MixedFusedRMSNorm(config.hidden_size, config.layernorm_epsilon)
         # Self attention.
-        self.self_attention = ParallelAttention(
-            config, layer_number, attention_type=AttnType.self_attn, attn_mask_type=self_attn_mask_type
-        )
+        if USE_MLA:
+            self.self_attention = ParallelAttentionMLA(
+                config, layer_number, attention_type=AttnType.self_attn, attn_mask_type=self_attn_mask_type
+            )
+        else:
+            self.self_attention = ParallelAttention(
+                config, layer_number, attention_type=AttnType.self_attn, attn_mask_type=self_attn_mask_type
+            )
         self.hidden_dropout = config.hidden_dropout
         self.bias_dropout_fusion = config.bias_dropout_fusion
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else None
@@ -992,7 +1454,10 @@ class ParallelTransformerLayer(MegatronModule):
             LayerType.retro_decoder_with_retriever,
             LayerType.retro_encoder,
         ):
-            self.inter_attention = ParallelAttention(config, layer_number, attention_type=AttnType.cross_attn)
+            if USE_MLA:
+                self.inter_attention = ParallelAttentionMLA(config, layer_number, attention_type=AttnType.cross_attn)
+            else:
+                self.inter_attention = ParallelAttention(config, layer_number, attention_type=AttnType.cross_attn)
             # Layernorm on the attention output.
             if args.normalization == "layernorm":
                 self.post_inter_attention_layernorm = LayerNorm(
@@ -1965,9 +2430,13 @@ class ParallelTransformer(MegatronModule):
         with rng_context:
             # The fp8_autocast context manager is a no-op when enabled=True
             # The if...else serves to short circuit name resolution for fp8_autocast
-            with transformer_engine.pytorch.fp8_autocast(
-                enabled=self.use_fp8, fp8_recipe=self.fp8_recipe, fp8_group=self.fp8_group
-            ) if self.use_fp8 else nullcontext():
+            with (
+                transformer_engine.pytorch.fp8_autocast(
+                    enabled=self.use_fp8, fp8_recipe=self.fp8_recipe, fp8_group=self.fp8_group
+                )
+                if self.use_fp8
+                else nullcontext()
+            ):
                 # Determine if the current iteration is first microbatch
                 if self.num_microbatches_in_previous_step != get_num_microbatches():
                     self.microbatch_count = 0  # Reset count on new batch size rampup interval
